@@ -1,0 +1,292 @@
+title: Airflow · Now
+text: |
+  **{{ queries.headline.one.verdict }}** {{ queries.headline.one.freshness }}
+
+variables:
+  team:
+    column: marts.dim_dags.team
+
+queries:
+  headline:
+    notes: One line - is anything wrong, and how old is the data (the local copy is only as fresh as the last make refresh).
+    sql: |
+      with h as (
+        select count(*) as dags, count(*) filter (attention = 'now') as now_n, max(as_of) as as_of
+        from marts.dag_health
+        where {{ filter('team', team) }}
+      ),
+      e as (select count(*) as broken_files from staging.stg_airflow__import_errors)
+      select
+        case when now_n + broken_files = 0 then 'All ' || dags || ' scheduled DAGs are fine.'
+             when now_n = 0 then broken_files || ' DAG file(s) fail to import.'
+             else now_n || ' of ' || dags || ' scheduled DAGs need attention.' end           as verdict,
+        'Data as of ' || strftime(timezone('UTC', as_of), '%H:%M') || ' UTC'
+          || case when epoch(now() - as_of) < 1800 then '.'
+                  else ' (' || case when epoch(now() - as_of) < 5400 then round(epoch(now() - as_of) / 60)::int || ' min'
+                                    when epoch(now() - as_of) < 172800 then round(epoch(now() - as_of) / 3600)::int || ' h'
+                                    else round(epoch(now() - as_of) / 86400)::int || ' days' end
+                       || ' ago): `make refresh`, then reload, for newer.' end                as freshness
+      from h, e
+
+  kpis:
+    sql: |
+      with h as (
+        select
+          count(*) filter (status = 'failing' and attention = 'now')        as failing,
+          count(*) filter (status = 'failing' and attention = 'neglected')  as failing_old,
+          count(*) filter (status = 'late' and attention = 'now')           as late,
+          count(*) filter (status = 'running long')                         as running_long,
+          count(*) filter (status = 'running')                              as running,
+          count(*) filter (attention = 'now') > 0                           as has_attention,
+          count(*) filter (attention = 'neglected') > 0                     as has_neglected,
+          count(*) filter (running_min is not null) > 0                     as has_running
+        from marts.dag_health
+        where {{ filter('team', team) }}
+      ),
+      t as (
+        select
+          count(*) filter (first_start_date > now() - interval 24 hour and attempt_count > 1)  as retried,
+          count(*) filter (first_start_date <= now() - interval 24 hour and attempt_count > 1) as retried_prev
+        from marts.fct_task_instances
+        where first_start_date > now() - interval 48 hour and {{ filter('team', team) }}
+      )
+      select h.*, t.retried, t.retried - t.retried_prev as retried_delta,
+             (select count(*) from staging.stg_airflow__import_errors) as broken_files
+      from h, t
+    formats:
+      retried_delta: delta
+
+  attention:
+    sql: |
+      select
+        status,
+        dag_id,
+        team,
+        since_utc                                                       as since,
+        case status
+          when 'failing'      then failed_in_a_row || ' failed run' || case when failed_in_a_row > 1 then 's' else '' end
+                                   || ' in a row · ' || coalesce(failed_tasks, 'no task failed (timeout?)')
+          when 'late'         then hours_late || ' h past its usual landing time'
+          when 'running long' then 'running ' || running_min::int || ' min, usually ' || p95_run_min::int || ' at most'
+        end                                                             as what,
+        coalesce(run_url, dag_url)                                      as airflow_url,
+        case when coalesce(run_url, dag_url) is not null then 'open ↗' end as airflow
+      from marts.dag_health
+      where attention = 'now' and {{ filter('team', team) }}
+
+  running_now:
+    notes: Every DAG with a run going right now - minutes so far vs its usual p95 duration.
+    sql: |
+      select dag_id, running_min, p95_run_min,
+             case when status = 'running long' then 'running long' else 'running' end as status
+      from marts.dag_health
+      where running_min is not null and {{ filter('team', team) }}
+      order by running_min desc
+      limit 15
+
+  last_24h:
+    notes: Runs started per hour over the last 24 hours, by how they ended.
+    sql: |
+      with r as (
+        select
+          date_trunc('hour', timezone('UTC', first_start_date))   as hour_utc,
+          case when state = 'running' then 'running'
+               when state = 'failed'  then 'failed'
+               when had_failure       then 'fixed by re-run'
+               when state = 'success' then 'success'
+               else 'other' end                                  as result,
+          count(*)                                               as runs
+        from marts.fct_dag_runs
+        where first_start_date > now() - interval 24 hour and {{ filter('team', team) }}
+        group by all
+      )
+      select hour_utc, result, sum(runs) as runs
+      from (
+        select * from r
+        union all   -- every outcome in the legend, even on a quiet day
+        select (select min(hour_utc) from r), unnest(['success', 'fixed by re-run', 'failed', 'running']), 0
+      )
+      group by all
+      order by hour_utc
+
+  failures_14d:
+    sql: |
+      select run_date, failure_outcome as outcome, count(*) as runs
+      from marts.fct_dag_runs
+      where had_failure and run_date > current_date - 14 and {{ filter('team', team) }}
+      group by all
+      order by run_date
+
+  neglected:
+    sql: |
+      select status, dag_id, since_utc as since,
+             round(hours_since / 24)::int as days, action,
+             dag_url as airflow_url,
+             case when dag_url is not null then 'open ↗' end as airflow
+      from marts.dag_health
+      where attention = 'neglected' and {{ filter('team', team) }}
+      order by hours_since desc
+
+  all_dags:
+    sql: |
+      with recent as (
+        select dag_id, list(round(completion_delay_s / 3600, 1) order by run_after) as last_landings_h
+        from (
+          select *, row_number() over (partition by dag_id order by run_after desc) as n
+          from marts.fct_dag_runs
+          where run_type = 'scheduled' and is_success
+        )
+        where n <= 20
+        group by all
+      )
+      select h.status, h.dag_id, h.team, h.every, h.last_landed, r.last_landings_h, h.usual_landing_h
+      from marts.dag_health h
+      left join recent r using (dag_id)
+      where {{ filter('h.team', team) }}
+      order by case h.status when 'failing' then 0 when 'running long' then 1 when 'late' then 2
+                             when 'removed' then 3 when 'running' then 4 else 5 end, h.dag_id
+
+charts:
+  failing_kpi:
+    type: kpi
+    query: kpis
+    value: failing
+    glyph: "🔥"
+    label: Failing
+    support:
+      value: failing_old
+      label: more failing for weeks
+  late_kpi:
+    type: kpi
+    query: kpis
+    value: late
+    glyph: "🐢"
+    label: Late
+  long_kpi:
+    type: kpi
+    query: kpis
+    value: running_long
+    glyph: "🐌"
+    label: Running too long
+    support:
+      value: running
+      label: running normally
+  files_kpi:
+    type: kpi
+    query: kpis
+    value: broken_files
+    glyph: "🧨"
+    label: DAG files failing to import
+  retried_kpi:
+    type: kpi
+    query: kpis
+    value: retried
+    glyph: "🔁"
+    label: Tasks retried · 24h
+    support:
+      value: retried_delta
+      label: vs the 24h before
+      good: down
+
+  attention_table:
+    type: table
+    query: attention
+    title: Needs attention now
+    style:
+      columns:
+        dag_id: {link: "/dag/?dag={{ dag_id }}"}
+        airflow: {link: {url: "{{ airflow_url }}", open: new_tab}}
+        airflow_url: {visible: false}
+    warnings_ignore: [WARN-QUERY-RETURNED-ZERO-ROWS]   # empty = all good
+    conditional_formatting:
+      status: &status_dots
+        when:
+          - {eq: failing, glyph: "●", tone: negative}
+          - {eq: running long, glyph: "●", tone: warning}
+          - {eq: late, glyph: "●", tone: warning}
+          - {eq: removed, glyph: "●", glyph_color: dbt-grays.5}
+          - {eq: running, glyph: "●", tone: info}
+          - {eq: on time, glyph: "●", tone: positive}
+
+  running_chart:
+    type: bar
+    query: running_now
+    title: Running now
+    subtitle: Minutes so far · dot = its usual p95 run time
+    x: dag_id
+    y: running_min
+    color: status
+    y_label: Minutes
+    style:
+      orientation: horizontal
+    link: "/dag/?dag={{ dag_id }}"
+    warnings_ignore: [WARN-QUERY-RETURNED-ZERO-ROWS, WARN-CATEGORY-COLOR-PIN-UNSEEN]   # live data: not every status shows every time
+    layers:
+      - type: scatter
+        y: p95_run_min
+        label: usual p95
+        style:
+          marks:
+            point: {color: "#1f1f1f"}
+
+  last_24h_chart:
+    type: bar
+    query: last_24h
+    title: Last 24 hours
+    subtitle: DAG runs started per hour (UTC), by how they ended
+    x: hour_utc
+    y: runs
+    color: result
+    style:
+      stack: zero
+
+  failures_chart:
+    type: bar
+    query: failures_14d
+    title: Runs with a failure · 14 days
+    subtitle: Amber = fixed by a re-run, red = still failed
+    x: run_date
+    y: runs
+    color: outcome
+    warnings_ignore: [WARN-QUERY-RETURNED-ZERO-ROWS, WARN-CATEGORY-COLOR-PIN-UNSEEN]
+    style:
+      stack: zero
+
+  neglected_table:
+    type: table
+    query: neglected
+    title: Neglected · failing or gone for a while
+    style:
+      columns:
+        dag_id: {link: "/dag/?dag={{ dag_id }}"}
+        airflow: {link: {url: "{{ airflow_url }}", open: new_tab}}
+        airflow_url: {visible: false}
+    warnings_ignore: [WARN-QUERY-RETURNED-ZERO-ROWS]
+    conditional_formatting:
+      status: *status_dots
+
+  all_dags_table:
+    type: table
+    query: all_dags
+    title: Every scheduled DAG
+    style:
+      columns:
+        dag_id: {link: "/dag/?dag={{ dag_id }}"}
+        last_landings_h: {label: Last 20 landings (h after due), spark: line}
+        usual_landing_h: {label: Usually lands after (h)}
+    conditional_formatting:
+      status: *status_dots
+
+rows:
+  - cols: [failing_kpi, late_kpi, long_kpi, files_kpi, retried_kpi]
+  - visible: {query: kpis, column: has_attention}   # shown only when something is wrong
+    rows: [attention_table]
+  - visible: {query: kpis, column: has_running}
+    rows: [running_chart]
+  - cols:
+      - width: 55%
+        rows: [last_24h_chart]
+      - failures_chart
+  - visible: {query: kpis, column: has_neglected}
+    rows: [neglected_table]
+  - all_dags_table

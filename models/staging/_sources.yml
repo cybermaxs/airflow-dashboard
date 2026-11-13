@@ -1,0 +1,11 @@
+sources:
+  - name: airflow
+    description: Airflow 3 metadata database (Postgres), attached read-only in DuckDB.
+    database: airflow
+    schema: public
+    tables:
+      - name: dag
+      - name: dag_run
+      - name: task_instance
+      - name: task_instance_history
+      - name: import_error

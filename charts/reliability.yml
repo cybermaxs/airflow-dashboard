@@ -1,0 +1,234 @@
+title: Airflow · Reliability & cost
+text: |
+  **{{ queries.kpis.one.retried_share }}** of task runs needed a retry over the period, throwing away
+  **{{ queries.kpis.one.retried_h_text }}** of worker time. Compute = the run time of every task try.
+
+variables:
+  team:
+    column: marts.dim_dags.team
+  period:
+    column: marts.fct_dag_runs.run_date
+    input: daterange
+    default: last_30_days
+
+queries:
+  kpis:
+    sql: |
+      with r as (
+        select
+          avg((not had_failure)::int) filter (is_finished)        as first_try_success,
+          count(*) filter (had_failure)                           as failed_runs
+        from marts.fct_dag_runs
+        where {{ filter_date_range('run_date', period) }} and {{ filter('team', team) }}
+      ),
+      t as (
+        select
+          count(*) filter (attempt_count > 1)                     as retried,
+          avg((attempt_count > 1)::int)                           as retried_share_n,
+          sum(compute_s) / 3600                                   as compute_h,
+          coalesce(sum(retried_s), 0) / 3600                      as retried_h
+        from marts.fct_task_instances
+        where {{ filter_date_range('run_date', period) }} and {{ filter('team', team) }}
+      )
+      select r.*, t.*,
+             round(100 * retried_share_n, 1) || '%'               as retried_share,
+             round(retried_h)::int || ' h'                        as retried_h_text
+      from r, t
+    formats:
+      first_try_success: percent
+      compute_h: integer
+      retried_h: integer
+      retried: integer
+
+  least_reliable:
+    notes: The 10 DAGs with the most runs that had a failure.
+    sql: |
+      select dag_id, failure_outcome as outcome, count(*) as runs
+      from marts.fct_dag_runs
+      where had_failure
+        and {{ filter_date_range('run_date', period) }} and {{ filter('team', team) }}
+        and dag_id in (
+          select dag_id from marts.fct_dag_runs
+          where had_failure and {{ filter_date_range('run_date', period) }} and {{ filter('team', team) }}
+          group by all order by count(*) desc, dag_id limit 10
+        )
+      group by all
+      order by runs desc
+
+  flaky_tasks:
+    notes: Tasks that most often needed a retry, with the worker time the failed tries cost.
+    sql: |
+      select
+        dag_id,
+        task_id,
+        count(*) filter (attempt_count > 1)                              as retried,
+        round(100.0 * count(*) filter (attempt_count > 1) / count(*), 1) as retried_pct,
+        round(coalesce(sum(retried_s), 0) / 3600, 1)                     as lost_h,
+        count(*) filter (final_state = 'failed')                         as failed
+      from marts.fct_task_instances
+      where {{ filter_date_range('run_date', period) }} and {{ filter('team', team) }}
+      group by all
+      having retried > 0
+      order by retried desc, lost_h desc
+      limit 15
+
+  landing_grid:
+    notes: Daily DAGs only. Hours from the scheduled time to the end of each successful run.
+    sql: |
+      select
+        r.run_after::date                          as scheduled_day,
+        r.dag_id,
+        round(r.completion_delay_s / 3600, 1)      as landed_after_h
+      from marts.fct_dag_runs r
+      join marts.dim_dags d using (dag_id)
+      where r.run_type = 'scheduled'
+        and r.is_success
+        and d.schedule_interval_h = 24
+        and not d.is_paused
+        and not d.is_stale
+        and {{ filter_date_range('r.run_date', period) }}
+        and {{ filter('d.team', team) }}
+      order by r.dag_id, scheduled_day
+
+  compute_by_team_day:
+    sql: |
+      select run_date, team, round(sum(compute_s) / 3600, 1) as compute_h
+      from marts.fct_task_instances
+      where {{ filter_date_range('run_date', period) }} and {{ filter('team', team) }}
+        and run_date < current_date   -- today is not over yet
+      group by all
+      order by run_date
+
+  compute_top_dags:
+    sql: |
+      select dag_id, team, round(sum(compute_s) / 3600) as compute_h
+      from marts.fct_task_instances
+      where {{ filter_date_range('run_date', period) }} and {{ filter('team', team) }}
+      group by all
+      order by compute_h desc
+      limit 10
+
+  punch_card:
+    notes: Worker hours by weekday and hour (UTC) of the task start.
+    sql: |
+      select
+        strftime(timezone('UTC', first_start_date), '%H')   as hour_utc,
+        strftime(timezone('UTC', first_start_date), '%a')   as weekday,
+        isodow(timezone('UTC', first_start_date))           as dow,
+        round(sum(compute_s) / 3600, 1)                     as compute_h
+      from marts.fct_task_instances
+      where {{ filter_date_range('run_date', period) }} and {{ filter('team', team) }}
+        and first_start_date is not null
+      group by all
+      order by dow, hour_utc
+
+charts:
+  success_kpi:
+    type: kpi
+    query: kpis
+    value: first_try_success
+    glyph: "🎯"
+    label: Runs OK on the first try
+  failed_kpi:
+    type: kpi
+    query: kpis
+    value: failed_runs
+    glyph: "💥"
+    label: Runs with a failure
+  retried_kpi:
+    type: kpi
+    query: kpis
+    value: retried
+    glyph: "🔁"
+    label: Task runs retried
+  compute_kpi:
+    type: kpi
+    query: kpis
+    value: compute_h
+    glyph: "🔋"
+    label: Compute hours
+    support:
+      value: retried_h
+      label: h lost to retries
+
+  least_reliable_chart:
+    type: bar
+    query: least_reliable
+    title: Least reliable DAGs
+    subtitle: Runs with a failure · amber = fixed by a re-run, red = still failed
+    x: dag_id
+    y: runs
+    color: outcome
+    link: "/dag/?dag={{ dag_id }}"
+    style:
+      stack: zero
+
+  flaky_table:
+    type: table
+    query: flaky_tasks
+    title: Flakiest tasks
+    style:
+      columns:
+        dag_id: {link: "/dag/?dag={{ dag_id }}"}
+        retried_pct: {label: "% retried"}
+        lost_h: {label: Hours lost, scale: {background: {palette: dbt-seq-rust}}}
+
+  landing_heatmap:
+    type: heatmap
+    query: landing_grid
+    title: Daily DAGs · when the data landed
+    subtitle: Hours from the scheduled time to the end of the run · darker = later · blank = no successful run
+    x: scheduled_day
+    y: dag_id
+    color: landed_after_h
+    height: 560
+    style:
+      color:
+        gradient:
+          palette: dbt-seq-amber
+
+  compute_area:
+    type: area
+    query: compute_by_team_day
+    title: Compute hours per day, by team
+    x: run_date
+    y: compute_h
+    color: team
+    style:
+      stack: zero
+
+  compute_top_chart:
+    type: bar
+    query: compute_top_dags
+    title: Hungriest DAGs
+    subtitle: Compute hours over the period
+    x: dag_id
+    y: compute_h
+    color: team
+    link: "/dag/?dag={{ dag_id }}"
+
+  punch:
+    type: heatmap
+    query: punch_card
+    title: When the workers are busiest
+    subtitle: Compute hours by weekday and hour of the task start (UTC)
+    x: hour_utc
+    y: weekday
+    color: compute_h
+    style:
+      color:
+        gradient:
+          palette: dbt-seq-purple
+
+rows:
+  - cols: [success_kpi, failed_kpi, retried_kpi, compute_kpi]
+  - cols:
+      - width: 36%
+        rows: [least_reliable_chart]
+      - flaky_table
+  - landing_heatmap
+  - cols:
+      - width: 58%
+        rows: [compute_area]
+      - compute_top_chart
+  - punch

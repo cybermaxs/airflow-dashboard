@@ -1,0 +1,309 @@
+title: "DAG · `{{ queries.info.one.dag_id }}`"
+text: |
+  **{{ queries.info.one.status_line }}** · team {{ queries.info.one.team }} · schedule `{{ queries.info.one.schedule }}`{% if queries.info.one.dag_url %} · [open in Airflow ↗]({{ queries.info.one.dag_url }}){% endif %}
+
+  {{ queries.info.one.note }}
+
+variables:
+  dag:
+    column: marts.dim_dags.dag_id
+  period:
+    column: marts.fct_dag_runs.run_date
+    input: daterange
+    default: last_30_days
+
+queries:
+  info:
+    sql: |
+      with picked as (
+        select coalesce(
+          (select dag_id from marts.dim_dags where {{ filter('dag_id', dag, none='deny') }}),
+          (select dag_id from marts.dag_health where attention = 'now' limit 1),
+          (select dag_id from marts.fct_dag_runs
+           where had_failure and run_date > current_date - 7 group by all order by count(*) desc, dag_id limit 1),
+          (select dag_id from marts.fct_task_instances
+           where run_date > current_date - 30 group by all order by count(*) desc, dag_id limit 1)
+        ) as dag_id
+      )
+      select
+        d.dag_id, d.team,
+        coalesce(d.timetable_summary, 'none')                              as schedule,
+        case when d.is_paused then 'Paused'
+             when h.status is null then 'Not monitored (unscheduled)'
+             when h.status = 'failing' then 'Failing since ' || h.since_utc || ' UTC'
+             when h.status = 'late' then 'Late by ' || h.hours_late || ' h'
+             when h.status = 'running long' then 'Running for ' || h.running_min::int || ' min (usually ' || h.p95_run_min::int || ' at most)'
+             when h.status = 'removed' then 'Removed from the code, but not paused'
+             else upper(h.status[1]) || h.status[2:] end                                    as status_line,
+        (select base_url from marts.airflow_ui) || '/dags/' || url_encode(d.dag_id) as dag_url,
+        {{ "''" if dag else "'No DAG picked: showing the one that needs attention, else the one with the most failed runs this week.'" }} as note
+      from marts.dim_dags d
+      join picked using (dag_id)
+      left join marts.dag_health h using (dag_id)
+
+  kpis:
+    sql: |
+      select
+        count(*)                                                      as runs,
+        avg((not had_failure)::int) filter (is_finished)              as first_try_success,
+        median(duration_s) filter (not was_cleared) / 60              as p50_min,
+        quantile_cont(duration_s, 0.95) filter (not was_cleared) / 60 as p95_min
+      from marts.fct_dag_runs
+      where dag_id = (select dag_id from {{ queries.info }})
+        and {{ filter_date_range('run_date', period) }}
+    formats:
+      first_try_success: percent
+      p50_min: number
+      p95_min: number
+
+  daily_durations:
+    notes: Run duration per day, median and p95 (cleared runs left out, their duration is the re-run only).
+    sql: |
+      with d as (
+        select
+          run_date,
+          round(median(duration_s) / 60, 1)                as median,
+          round(quantile_cont(duration_s, 0.95) / 60, 1)   as p95
+        from marts.fct_dag_runs
+        where dag_id = (select dag_id from {{ queries.info }})
+          and {{ filter_date_range('run_date', period) }}
+          and duration_s is not null
+          and not was_cleared
+        group by all
+      ),
+      days as (   -- every day, so a day without a run is a gap, not a straight line
+        select unnest(generate_series(min(run_date), max(run_date), interval 1 day))::date as run_date from d
+      )
+      select run_date, d.median, d.p95
+      from days left join d using (run_date)
+      order by run_date
+
+  typical_durations:
+    notes: Run durations without the slowest 1%, so one stuck run doesn't flatten the histogram.
+    sql: |
+      select duration_min from (
+        select duration_s / 60 as duration_min,
+               duration_s <= quantile_cont(duration_s, 0.99) over () as is_typical
+        from marts.fct_dag_runs
+        where dag_id = (select dag_id from {{ queries.info }})
+          and {{ filter_date_range('run_date', period) }}
+          and duration_s is not null
+          and not was_cleared
+      )
+      where is_typical
+
+  last_run:
+    sql: |
+      select run_id, first_start_date, strftime(timezone('UTC', first_start_date), '%Y-%m-%d %H:%M') as started
+      from marts.fct_dag_runs
+      where dag_id = (select dag_id from {{ queries.info }}) and is_finished
+      order by run_after desc
+      limit 1
+
+  gantt_rows:
+    notes: The 40 longest tasks of the latest finished run, in start order, colored by the task's leading word.
+    sql: |
+      with tasks as (
+        select
+          task_id || case when map_index >= 0 then ' [' || map_index || ']' else '' end as task,
+          split_part(task_id, '_', 1)                                        as step,
+          epoch(t.first_start_date - last_run.first_start_date) / 60         as start_min,
+          epoch(t.last_end_date - last_run.first_start_date) / 60            as end_min
+        from marts.fct_task_instances t
+        join {{ queries.last_run }} using (run_id)
+        where t.dag_id = (select dag_id from {{ queries.info }})
+          and t.first_start_date is not null and t.last_end_date is not null
+        order by end_min - start_min desc
+        limit 40
+      )
+      select * from tasks order by start_min
+
+  grid:
+    notes: Airflow's grid view - the last 30 runs, the 20 tasks with the most trouble (then the slowest), colored by how each ended.
+    sql: |
+      with runs as (
+        select run_id, row_number() over (order by run_after) as run_number
+        from (
+          select * from marts.fct_dag_runs
+          where dag_id = (select dag_id from {{ queries.info }})
+          order by run_after desc
+          limit 30
+        )
+      ),
+      t as (
+        select t.*, r.run_number
+        from marts.fct_task_instances t
+        join runs r using (run_id)
+        where t.dag_id = (select dag_id from {{ queries.info }})
+      ),
+      top_tasks as (
+        select task_id
+        from t
+        group by all
+        order by count(*) filter (final_state != 'success' or attempt_count > 1) desc,
+                 sum(final_duration_s) desc nulls last
+        limit 20
+      )
+      select
+        run_number                                                   as run,
+        task_id                                                      as task,
+        case
+          when bool_or(final_state = 'failed')                       then 'failed'
+          when bool_or(final_state = 'upstream_failed')              then 'upstream failed'
+          when bool_or(final_state in ('running', 'queued', 'scheduled', 'up_for_retry', 'deferred')) then 'running'
+          when bool_and(final_state = 'skipped')                     then 'skipped'
+          when bool_or(attempt_count > 1)                            then 'ok after retry'
+          else 'ok'
+        end                                                          as task_result
+      from t
+      where task_id in (select task_id from top_tasks)
+      group by all
+      order by run, task
+
+  troubles:
+    notes: The latest task runs that failed or needed a retry, with a link to their logs in Airflow.
+    sql: |
+      select
+        strftime(timezone('UTC', first_start_date), '%m-%d %H:%M')         as started_utc,
+        task_id || case when map_index >= 0 then ' [' || map_index || ']' else '' end as task,
+        case when final_state = 'success' then 'ok after retry' else replace(final_state, '_', ' ') end as result,
+        attempt_count                                                      as tries,
+        round(coalesce(retried_s, 0) / 60, 1)                              as lost_min,
+        run_id,
+        (select base_url from marts.airflow_ui) || '/dags/' || url_encode(dag_id) || '/runs/' || url_encode(run_id)
+          || '/tasks/' || url_encode(task_id) || case when map_index >= 0 then '/mapped/' || map_index else '' end as log_url,
+        case when (select base_url from marts.airflow_ui) is not null then 'logs ↗' end as logs
+      from marts.fct_task_instances
+      where dag_id = (select dag_id from {{ queries.info }})
+        and {{ filter_date_range('run_date', period) }}
+        and (final_state in ('failed', 'upstream_failed') or attempt_count > 1)
+      order by first_start_date desc
+      limit 15
+
+  slowest_tasks:
+    sql: |
+      select
+        task_id,
+        count(*)                                                as runs,
+        round(median(final_duration_s) / 60, 1)                 as p50_min,
+        round(quantile_cont(final_duration_s, 0.95) / 60, 1)    as p95_min,
+        list(round(final_duration_s / 60, 1) order by first_start_date) as minutes_per_run,
+        count(*) filter (attempt_count > 1)                     as retried,
+        count(*) filter (final_state = 'failed')                as failed
+      from marts.fct_task_instances
+      where dag_id = (select dag_id from {{ queries.info }})
+        and {{ filter_date_range('run_date', period) }}
+      group by all
+      order by p50_min desc
+      limit 15
+
+charts:
+  runs_kpi:
+    type: kpi
+    query: kpis
+    value: runs
+    glyph: "🚀"
+    label: Runs
+  success_kpi:
+    type: kpi
+    query: kpis
+    value: first_try_success
+    glyph: "🎯"
+    label: OK on the first try
+  p50_kpi:
+    type: kpi
+    query: kpis
+    value: p50_min
+    glyph: "🐇"
+    label: Median run (min)
+  p95_kpi:
+    type: kpi
+    query: kpis
+    value: p95_min
+    glyph: "🐢"
+    label: p95 run (min)
+
+  duration_trend:
+    type: line
+    query: daily_durations
+    title: Is it getting slower?
+    subtitle: Run duration per day · median and p95 · cleared runs left out
+    x: run_date
+    y: [median, p95]
+    y_label: Minutes
+    style:
+      endpoint_labels: {visible: false}   # end-of-line labels can't handle days without a run: legend instead
+
+  duration_hist:
+    type: histogram
+    query: typical_durations
+    title: How long a run usually takes
+    subtitle: Minutes · slowest 1% left out
+    x: duration_min
+    style:
+      color:
+        static: category[3]
+
+  grid_view:
+    type: heatmap
+    query: grid
+    title: Grid view · last 30 runs
+    subtitle: Like Airflow's grid, oldest run on the left · the 20 tasks with the most trouble, then the slowest
+    x: run
+    y: task
+    color: task_result
+    height: 520
+    warnings_ignore: [WARN-CATEGORY-COLOR-PIN-UNSEEN]
+
+  troubles_table:
+    type: table
+    query: troubles
+    title: Latest task failures and retries
+    warnings_ignore: [WARN-QUERY-RETURNED-ZERO-ROWS]
+    style:
+      columns:
+        logs: {link: {url: "{{ log_url }}", open: new_tab}, label: Airflow}
+        log_url: {visible: false}
+        lost_min: {label: Min lost to retries}
+        started_utc: {label: Started (UTC)}
+    conditional_formatting:
+      result:
+        when:
+          - {eq: failed, glyph: "●", tone: negative}
+          - {eq: upstream failed, glyph: "●", tone: negative}
+          - {eq: ok after retry, glyph: "●", tone: warning}
+
+  gantt:
+    type: bar
+    query: gantt_rows
+    title: "Latest run · 40 longest tasks"
+    subtitle: "{{ queries.last_run.one.run_id }}, started {{ queries.last_run.one.started }} UTC · color = first word of the task id"
+    x: task
+    y: end_min
+    y_start: start_min
+    y_label: Minutes from run start
+    color: step
+
+  slowest:
+    type: table
+    query: slowest_tasks
+    title: Slowest tasks
+    style:
+      columns:
+        minutes_per_run:
+          spark: area
+        p95_min:
+          scale:
+            background:
+              palette: dbt-seq-rust
+
+rows:
+  - cols: [runs_kpi, success_kpi, p50_kpi, p95_kpi]
+  - cols:
+      - width: 65%
+        rows: [duration_trend]
+      - duration_hist
+  - grid_view
+  - troubles_table
+  - gantt
+  - slowest

@@ -1,0 +1,35 @@
+models:
+  - name: dim_dags
+    description: One row per DAG with its team and real schedule interval.
+    columns:
+      - name: dag_id
+        data_tests: [unique, not_null]
+      - name: team
+        description: From the dag_id prefix, via AIRFLOW_DAG_TEAMS in .env (kept private) or seeds/dag_teams.csv.
+      - name: schedule_interval_h
+        description: Median gap between scheduled runs (null for unscheduled DAGs).
+  - name: fct_dag_runs
+    description: One row per DAG run.
+    columns:
+      - name: dag_run_id
+        data_tests: [unique, not_null]
+      - name: had_failure
+        description: Failed now, or cleared after a failed try (fixed by hand). `state = 'failed'` misses the latter.
+      - name: duration_s
+        description: "Last execution only (after a clear, the re-run): filter `not was_cleared` for duration stats."
+      - name: completion_delay_s
+        description: Due (run_after) -> end. How late the data landed.
+  - name: fct_task_instances
+    description: One row per task instance, all tries rolled up.
+  - name: dag_health
+    description: Per scheduled, unpaused DAG - is it OK right now, and if not since when (see the model's header).
+    columns:
+      - name: dag_id
+        data_tests: [unique, not_null]
+      - name: status
+        data_tests:
+          - accepted_values:
+              arguments:
+                values: [removed, failing, running long, late, running, on time]
+      - name: attention
+        description: "'now' = broke recently; 'neglected' = removed, or failing/late for over max(7 days, 2 schedule intervals)."

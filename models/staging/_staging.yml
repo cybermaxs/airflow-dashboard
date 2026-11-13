@@ -1,0 +1,17 @@
+models:
+  - name: stg_airflow__dags
+    columns:
+      - name: dag_id
+        data_tests: [unique, not_null]
+  - name: stg_airflow__import_errors
+    description: DAG files Airflow cannot parse right now, with the last line of the error.
+  - name: stg_airflow__dag_runs
+    description: Incremental local copy of dag_run (re-reads the last `lookback_days` of updates).
+    columns:
+      - name: dag_run_id
+        data_tests: [unique, not_null]
+  - name: stg_airflow__task_attempts
+    description: One row per task try = task_instance (latest try) ∪ task_instance_history (earlier tries).
+    columns:
+      - name: attempt_id
+        data_tests: [unique, not_null]

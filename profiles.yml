@@ -1,0 +1,25 @@
+airflow_dashboard:
+  # live: your Airflow 3 Postgres metadata DB, attached read-only through DuckDB's postgres extension,
+  #       copied into dashboard.duckdb. Connection: AIRFLOW_PG_* in .env, password in PGPASSWORD.
+  # demo: a made-up Airflow (demo/fake_airflow.sql) in demo/fake_airflow.duckdb, built into demo.duckdb.
+  target: "{{ env_var('DBT_TARGET', 'live') }}"
+  outputs:
+    live:
+      type: duckdb
+      path: "{{ env_var('DUCKDB_PATH', 'dashboard.duckdb') }}"
+      threads: 4
+      extensions: [postgres]
+      attach:
+        - path: "host={{ env_var('AIRFLOW_PG_HOST', 'localhost') }} port={{ env_var('AIRFLOW_PG_PORT', '5432') }} dbname={{ env_var('AIRFLOW_PG_DB', 'airflow') }} user={{ env_var('AIRFLOW_PG_USER', 'airflow') }}"
+          alias: airflow
+          type: postgres
+          read_only: true
+
+    demo:
+      type: duckdb
+      path: "{{ env_var('DUCKDB_PATH', 'demo.duckdb') }}"
+      threads: 4
+      attach:
+        - path: demo/fake_airflow.duckdb   # same tables as Airflow's Postgres, same `airflow` alias
+          alias: airflow
+          read_only: true

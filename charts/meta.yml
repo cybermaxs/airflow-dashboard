@@ -1,0 +1,17 @@
+# meta.yml: defaults for every board in this folder and below. A board's own keys win.
+source: airflow
+
+style:
+  charts:
+    # one color per Airflow outcome, the same on every board: green ok, amber needed help, red broken, blue running
+    category_colors:
+      state:
+        values: {success: positive.solid, failed: negative.solid}
+      outcome:
+        values: {"fixed by re-run": warning.solid, "still failed": negative.solid}
+      result:
+        values: {success: positive.solid, "fixed by re-run": warning.solid, failed: negative.solid, running: info.solid}
+      status:
+        values: {"on time": positive.solid, running: info.solid, "running long": warning.solid, late: warning.solid, failing: negative.solid}
+      task_result:
+        values: {ok: positive.solid, "ok after retry": warning.solid, failed: negative.solid, "upstream failed": negative.subtle, skipped: dbt-grays.3, running: info.solid}
