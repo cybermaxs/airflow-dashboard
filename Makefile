@@ -1,5 +1,6 @@
 # Airflow 3 monitoring with DuckDB + dbt + dbt Charts. Everything runs on your laptop.
 #
+#   make install    duckdb (brew, if missing) + dbt Fusion and dct (uv tools)
 #   make demo       a made-up Airflow, no database needed: generate it, dbt build, then the dashboards
 #   make live       your Airflow 3: load what's new, then the dashboards
 #   make refresh    your Airflow 3: load what's new (then reload the page)
@@ -27,7 +28,14 @@ endif
 export DBT_TARGET := $(MODE)
 export DUCKDB_PATH PGPASSWORD AIRFLOW_PG_HOST AIRFLOW_PG_PORT AIRFLOW_PG_DB AIRFLOW_PG_USER AIRFLOW_DAG_TEAMS AIRFLOW_UI_URL
 
-.PHONY: demo live fake tools check refresh full-refresh test serve stop open shell
+.PHONY: install demo live fake tools check refresh full-refresh test serve stop open shell
+
+install:           ## duckdb (brew, if missing) + dbt Fusion and dct as uv tools, in ~/.local/bin
+	@command -v uv >/dev/null || { echo "missing uv: brew install uv  (https://docs.astral.sh/uv/)"; exit 1; }
+	@command -v duckdb >/dev/null || brew install duckdb
+	uv tool install --upgrade "dbt>=2.0.11"
+	uv tool install --upgrade dbt-charts
+	@$(MAKE) --no-print-directory tools
 
 demo:              ## made-up Airflow, no database needed -> dashboards on http://localhost:$(PORT)
 	@$(MAKE) --no-print-directory MODE=demo tools fake refresh serve open
@@ -41,8 +49,8 @@ fake:              ## a made-up Airflow 3 metadata DB whose history ends now (de
 
 tools:             ## are duckdb, dbt (Fusion) and dct installed?
 	@command -v duckdb >/dev/null || { echo "missing duckdb: brew install duckdb  (https://duckdb.org/install)"; exit 1; }
-	@command -v dbt    >/dev/null || { echo "missing dbt:    curl -fsSL https://public.cdn.getdbt.com/fs/install/install.sh | sh -s -- --update"; exit 1; }
-	@command -v dct    >/dev/null || { echo "missing dct:    uv tool install dbt-charts"; exit 1; }
+	@command -v dbt    >/dev/null || { echo "missing dbt:    make install"; exit 1; }
+	@command -v dct    >/dev/null || { echo "missing dct:    make install"; exit 1; }
 	@echo "$$(duckdb --version | cut -d' ' -f1) duckdb · $$(dbt --version | head -1) · dct $$(dct --version 2>/dev/null | cut -d' ' -f2) · $(MODE) -> $(DUCKDB_PATH)"
 
 check: tools       ## ... and is the Airflow connection set?

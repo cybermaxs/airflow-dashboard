@@ -13,10 +13,8 @@ Airflow 3 metadata DB ──DuckDB postgres extension──▶ DuckDB file ─�
 ## Try it: no Airflow needed
 
 ```bash
-brew install duckdb uv                                                               # DuckDB 2.x
-curl -fsSL https://public.cdn.getdbt.com/fs/install/install.sh | sh -s -- --update   # dbt Fusion >= 2.0.11
-uv tool install dbt-charts                                                           # dct
-
+brew install uv
+make install             # DuckDB 2.x (brew, if missing) + dbt Fusion >= 2.0.11 and dct (dbt Charts) as uv tools
 make demo                # ~10 s, then http://localhost:8080/now/
 ```
 
