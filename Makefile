@@ -12,7 +12,6 @@
 
 MODE ?= live
 PORT ?= 8080
-KEYCHAIN_SERVICE ?= airflow-pg
 
 ifeq ($(MODE),demo)
 DUCKDB_PATH := demo.duckdb
@@ -21,8 +20,7 @@ AIRFLOW_UI_URL := https://airflow.example.com# links show, but lead nowhere
 FULL := --full-refresh                      # the made-up history ends now: rebuild it whole
 else
 DUCKDB_PATH ?= dashboard.duckdb
-# Postgres password: PGPASSWORD from your environment, else macOS Keychain (see .env.example)
-PGPASSWORD ?= $(shell security find-generic-password -s $(KEYCHAIN_SERVICE) -a $(AIRFLOW_PG_USER) -w 2>/dev/null)
+# Postgres password: PGPASSWORD from your environment (never in .env or the repo)
 endif
 
 export DBT_TARGET := $(MODE)
@@ -55,7 +53,7 @@ tools:             ## are duckdb, dbt (Fusion) and dct installed?
 
 check: tools       ## ... and is the Airflow connection set?
 	@test -n "$(AIRFLOW_PG_HOST)" || { echo "no Airflow connection: cp .env.example .env and fill it in"; exit 1; }
-	@test -n "$(PGPASSWORD)" || { echo "no password: export PGPASSWORD=... or store it in Keychain (see .env.example)"; exit 1; }
+	@test -n "$(PGPASSWORD)" || { echo "no password: export PGPASSWORD=..."; exit 1; }
 	@echo "reading $(AIRFLOW_PG_DB)@$(AIRFLOW_PG_HOST)"
 
 refresh:           ## load what's new from Airflow (incremental; always full in demo) + marts + tests

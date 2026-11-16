@@ -28,7 +28,7 @@ Then it runs the same dbt models and boards as on a real Airflow. The screenshot
 
 ```bash
 cp .env.example .env     # your Airflow metadata DB host/db/user (read-only is enough), UI URL, team names
-export PGPASSWORD=...    # or store it in macOS Keychain, see .env.example
+export PGPASSWORD=...    # the read-only user's password, from your environment
 
 make live                # load what's new (seconds after the first load), open http://localhost:8080/now/
 ```
